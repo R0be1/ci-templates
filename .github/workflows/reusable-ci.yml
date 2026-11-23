@@ -198,7 +198,7 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/gitleaks.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: reports/gitleaks.sarif
           category: gitleaks
@@ -260,7 +260,7 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: reports/semgrep.sarif
           category: semgrep
@@ -416,7 +416,7 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles(format('reports/snyk-{0}.sarif', matrix.component.name)) != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: reports/snyk-${{ matrix.component.name }}.sarif
           category: snyk-${{ matrix.component.name }}
@@ -532,7 +532,7 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/dependency-check/dependency-check-report.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: reports/dependency-check/dependency-check-report.sarif
           category: dependency-check
