@@ -1,0 +1,29 @@
+# Copy to <your-project>/.github/workflows/ci.yml. It is identical for every project.
+# All project-specific settings live in .ci/ci.yml.
+name: CI
+
+on:
+  push:
+    branches: ["**"]                 # every push, including merges into protected branches
+    paths-ignore: ["**/*.md", "docs/**"]
+  pull_request:                      # PR opened or updated (no paths-ignore here, or required checks can hang)
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 2 * * 1"             # weekly full security scan (Mon 02:17 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write             # only used when upload-sarif: true
+  actions: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: R0be1/ci-templates/.github/workflows/reusable-ci.yml@v1
+    with:
+      config-file: .ci/ci.yml
+    secrets: inherit

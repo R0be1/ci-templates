@@ -1,0 +1,616 @@
+# =============================================================================
+# Reusable CI: code quality, unit tests and security scanning ONLY.
+#
+# This workflow NEVER deploys, publishes images or packages, creates releases,
+# or connects to servers. You deploy manually after reviewing the results.
+#
+# Called from each project with:
+#   jobs:
+#     ci:
+#       uses: R0be1/ci-templates/.github/workflows/reusable-ci.yml@v1
+#       secrets: inherit
+# =============================================================================
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: Path (in the calling repo) to the project CI config.
+        type: string
+        default: .ci/ci.yml
+      runs-on:
+        description: Runner label used by every job.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
+      NVD_API_KEY:
+        required: false
+
+# Least privilege. Jobs that may upload SARIF add security-events: write.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Tool versions are pinned centrally: bump them here and every project gets the update.
+  GITLEAKS_VERSION: "8.24.0"
+  DEPENDENCY_CHECK_VERSION: "12.1.0"
+  SEMGREP_VERSION: ""          # empty = latest
+  DC_DATA_DIR: /home/runner/.dependency-check-data
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Read .ci/ci.yml and turn it into job inputs and a component matrix
+  # ---------------------------------------------------------------------------
+  config:
+    name: Load config
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      components:        ${{ steps.cfg.outputs.components }}
+      secrets-enabled:   ${{ steps.cfg.outputs.secrets-enabled }}
+      secrets-fail:      ${{ steps.cfg.outputs.secrets-fail }}
+      sast-enabled:      ${{ steps.cfg.outputs.sast-enabled }}
+      sast-rules:        ${{ steps.cfg.outputs.sast-rules }}
+      sast-severity:     ${{ steps.cfg.outputs.sast-severity }}
+      sast-fail:         ${{ steps.cfg.outputs.sast-fail }}
+      snyk-enabled:      ${{ steps.cfg.outputs.snyk-enabled }}
+      snyk-threshold:    ${{ steps.cfg.outputs.snyk-threshold }}
+      snyk-org:          ${{ steps.cfg.outputs.snyk-org }}
+      dc-enabled:        ${{ steps.cfg.outputs.dc-enabled }}
+      dc-cvss:           ${{ steps.cfg.outputs.dc-cvss }}
+      dc-on-pr:          ${{ steps.cfg.outputs.dc-on-pr }}
+      dc-experimental:   ${{ steps.cfg.outputs.dc-experimental }}
+      sonar-enabled:     ${{ steps.cfg.outputs.sonar-enabled }}
+      sonar-prs:         ${{ steps.cfg.outputs.sonar-prs }}
+      sonar-qg:          ${{ steps.cfg.outputs.sonar-qg }}
+      sonar-org:         ${{ steps.cfg.outputs.sonar-org }}
+      sonar-prefix:      ${{ steps.cfg.outputs.sonar-prefix }}
+      upload-sarif:      ${{ steps.cfg.outputs.upload-sarif }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ inputs.config-file }}
+          sparse-checkout-cone-mode: false
+
+      - id: cfg
+        env:
+          CFG: ${{ inputs.config-file }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$CFG" ]; then echo "::error::Config file '$CFG' not found in this repository"; exit 1; fi
+
+          get() {  # get <yq-path> <default>
+            local v
+            v=$(yq -r "$1" "$CFG")
+            if [ "$v" = "null" ] || [ -z "$v" ]; then v="$2"; fi
+            printf '%s' "$v"
+          }
+
+          comps=$(yq -o=json -I=0 '.components // []' "$CFG")
+          if [ "$(jq 'length' <<<"$comps")" -eq 0 ]; then
+            echo "::error::No components defined in $CFG"; exit 1
+          fi
+          if ! jq -e 'all(.[]; (.name|type=="string") and (.name|test("^[A-Za-z0-9._-]+$"))
+                         and ((.language // "")|IN("node","python","java","dotnet")))' <<<"$comps" >/dev/null; then
+            echo "::error::Each component needs 'name' (letters, digits, . _ -) and 'language' (node|python|java|dotnet)"; exit 1
+          fi
+          comps=$(jq -c 'map(.path //= ".")' <<<"$comps")
+
+          default_prefix="${GITHUB_REPOSITORY//\//_}"
+          {
+            echo "components=$comps"
+            echo "secrets-enabled=$(get '.secrets.enabled' true)"
+            echo "secrets-fail=$(get '.secrets.fail-on-findings' true)"
+            echo "sast-enabled=$(get '.sast.enabled' true)"
+            echo "sast-rules=$(get '.sast.rules' 'p/default')"
+            echo "sast-severity=$(get '.sast.severity' 'ERROR')"
+            echo "sast-fail=$(get '.sast.fail-on-findings' false)"
+            echo "snyk-enabled=$(get '.snyk.enabled' false)"
+            echo "snyk-threshold=$(get '.snyk.severity-threshold' high)"
+            echo "snyk-org=$(get '.snyk.org' '')"
+            echo "dc-enabled=$(get '.dependency-check.enabled' true)"
+            echo "dc-cvss=$(get '.dependency-check.fail-on-cvss' 7)"
+            echo "dc-on-pr=$(get '.dependency-check.run-on-pull-requests' false)"
+            echo "dc-experimental=$(get '.dependency-check.enable-experimental' false)"
+            echo "sonar-enabled=$(get '.sonar.enabled' false)"
+            echo "sonar-prs=$(get '.sonar.analyze-pull-requests' true)"
+            echo "sonar-qg=$(get '.sonar.quality-gate' true)"
+            echo "sonar-org=$(get '.sonar.organization' '')"
+            echo "sonar-prefix=$(get '.sonar.project-key-prefix' "$default_prefix")"
+            echo "upload-sarif=$(get '.upload-sarif' false)"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### CI config ($CFG)" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "- **\(.name)**: \(.language) in `\(.path)`"' <<<"$comps" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 1. Secret detection (Gitleaks CLI, so no license key is needed)
+  #    PR: scans only the PR's commits. Push: only the pushed commits.
+  #    Schedule/manual: the full git history.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret detection (Gitleaks)
+    needs: config
+    if: needs.config.outputs.secrets-enabled == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Scan for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          FAIL: ${{ needs.config.outputs.secrets-fail }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports
+          range=""
+          if [ "$EVENT" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="${PUSH_BEFORE}..${GITHUB_SHA}"
+          fi
+          args=(git --redact --no-banner --report-format sarif --report-path reports/gitleaks.sarif --exit-code 1)
+          if [ -n "$range" ]; then args+=("--log-opts=$range"); echo "Incremental scan: $range"; else echo "Full history scan"; fi
+          # .gitleaks.toml / .gitleaksignore in the repo root are picked up automatically.
+          gitleaks "${args[@]}" .
+          rc=$?
+          count=$(jq '[.runs[].results[]] | length' reports/gitleaks.sarif 2>/dev/null || echo 0)
+          echo "### Gitleaks: ${count} potential secret(s)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            if [ "$FAIL" = "true" ]; then echo "::error::Gitleaks found ${count} potential secret(s). See the gitleaks report artifact."; exit 1; fi
+            echo "::warning::Gitleaks found ${count} potential secret(s) (not failing: secrets.fail-on-findings=false)"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-gitleaks
+          path: reports/gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload SARIF to code scanning
+        if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------------------
+  # 2. SAST (Semgrep Community Edition). On PRs only NEW findings are reported.
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    needs: config
+    if: needs.config.outputs.sast-enabled == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: |
+          if [ -n "$SEMGREP_VERSION" ]; then pip install "semgrep==${SEMGREP_VERSION}"; else pip install semgrep; fi
+
+      - name: Semgrep scan
+        env:
+          RULES: ${{ needs.config.outputs.sast-rules }}
+          SEVERITY: ${{ needs.config.outputs.sast-severity }}
+          FAIL: ${{ needs.config.outputs.sast-fail }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports
+          args=(scan --metrics=off --sarif --output reports/semgrep.sarif)
+          for r in $RULES; do args+=(--config "$r"); done
+          IFS=',' read -ra sev <<<"$SEVERITY"
+          for s in "${sev[@]}"; do args+=(--severity "$(tr -d ' ' <<<"$s")"); done
+          if [ -n "$BASE_SHA" ]; then args+=(--baseline-commit "$BASE_SHA"); fi
+          if [ "$FAIL" = "true" ]; then args+=(--error); fi
+          if [ -f .semgrepignore ]; then echo "Using .semgrepignore"; fi
+          semgrep "${args[@]}"
+          rc=$?
+          count=$(jq '[.runs[].results[]] | length' reports/semgrep.sarif 2>/dev/null || echo 0)
+          echo "### Semgrep: ${count} finding(s) (severity: ${SEVERITY})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$count" -gt 0 ]; then echo "::warning::Semgrep reported ${count} finding(s). See the semgrep report artifact."; fi
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-semgrep
+          path: reports/semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload SARIF to code scanning
+        if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  # 3. Lint, one job per component, in parallel
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (${{ matrix.component.name }})
+    needs: config
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.config.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: stack
+        uses: R0be1/ci-templates/actions/setup-stack@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ matrix.component['build-tool'] }}
+          version: ${{ matrix.component.version }}
+          project-file: ${{ matrix.component['project-file'] }}
+          install-command: ${{ matrix.component['install-command'] }}
+
+      - uses: R0be1/ci-templates/actions/lint@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ steps.stack.outputs.build-tool }}
+          project-file: ${{ matrix.component['project-file'] }}
+          command: ${{ matrix.component['lint-command'] }}
+
+  # ---------------------------------------------------------------------------
+  # 4. Unit tests + coverage, one job per component, in parallel
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests (${{ matrix.component.name }})
+    needs: config
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.config.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: stack
+        uses: R0be1/ci-templates/actions/setup-stack@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ matrix.component['build-tool'] }}
+          version: ${{ matrix.component.version }}
+          project-file: ${{ matrix.component['project-file'] }}
+          install-command: ${{ matrix.component['install-command'] }}
+
+      - uses: R0be1/ci-templates/actions/unit-test@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ steps.stack.outputs.build-tool }}
+          project-file: ${{ matrix.component['project-file'] }}
+          command: ${{ matrix.component['test-command'] }}
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.component.name }}
+          path: ${{ matrix.component.path }}/${{ matrix.component['coverage-dir'] || steps.stack.outputs.coverage-dir }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.component.name }}
+          path: |
+            ${{ matrix.component.path }}/target/surefire-reports
+            ${{ matrix.component.path }}/build/test-results
+            ${{ matrix.component.path }}/coverage/**/*.trx
+            ${{ matrix.component.path }}/coverage/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 5. Snyk Open Source (SCA), per component. Needs SNYK_TOKEN.
+  # ---------------------------------------------------------------------------
+  snyk:
+    name: Snyk (${{ matrix.component.name }})
+    needs: config
+    if: needs.config.outputs.snyk-enabled == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.config.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: stack
+        uses: R0be1/ci-templates/actions/setup-stack@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ matrix.component['build-tool'] }}
+          version: ${{ matrix.component.version }}
+          project-file: ${{ matrix.component['project-file'] }}
+          install-command: ${{ matrix.component['install-command'] }}
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk test
+        working-directory: ${{ matrix.component.path }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          THRESHOLD: ${{ needs.config.outputs.snyk-threshold }}
+          ORG: ${{ needs.config.outputs.snyk-org }}
+          NAME: ${{ matrix.component.name }}
+        run: |
+          set -uo pipefail
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::snyk.enabled is true but the SNYK_TOKEN secret is missing (caller must use 'secrets: inherit')"; exit 1
+          fi
+          out="$GITHUB_WORKSPACE/reports"; mkdir -p "$out"
+          args=(test --all-projects --severity-threshold="$THRESHOLD"
+                --json-file-output="$out/snyk-$NAME.json" --sarif-file-output="$out/snyk-$NAME.sarif")
+          if [ -n "$ORG" ]; then args+=(--org="$ORG"); fi
+          snyk "${args[@]}"
+          rc=$?
+          case "$rc" in
+            0) echo "### Snyk ($NAME): no issues at or above '$THRESHOLD'" >> "$GITHUB_STEP_SUMMARY" ;;
+            1) echo "### Snyk ($NAME): vulnerabilities at or above '$THRESHOLD' found" >> "$GITHUB_STEP_SUMMARY" ;;
+            3) echo "::warning::Snyk found no supported manifests in this component"; rc=0 ;;
+          esac
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-snyk-${{ matrix.component.name }}
+          path: reports/snyk-*
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload SARIF to code scanning
+        if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles(format('reports/snyk-{0}.sarif', matrix.component.name)) != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/snyk-${{ matrix.component.name }}.sarif
+          category: snyk-${{ matrix.component.name }}
+
+  # ---------------------------------------------------------------------------
+  # 6. OWASP Dependency-Check: whole repo, NVD database cached between runs.
+  #    By default it is skipped on PRs (Snyk covers PRs) to avoid scanning twice.
+  # ---------------------------------------------------------------------------
+  dependency-check:
+    name: OWASP Dependency-Check
+    needs: config
+    if: >-
+      needs.config.outputs.dc-enabled == 'true' &&
+      (github.event_name != 'pull_request' || needs.config.outputs.dc-on-pr == 'true')
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Dependency-Check CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/dc.zip" \
+            "https://github.com/dependency-check/DependencyCheck/releases/download/v${DEPENDENCY_CHECK_VERSION}/dependency-check-${DEPENDENCY_CHECK_VERSION}-release.zip"
+          unzip -q "$RUNNER_TEMP/dc.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/dependency-check/bin" >> "$GITHUB_PATH"
+          echo "week=$(date -u +%G-%V)" >> "$GITHUB_ENV"
+
+      - name: Restore vulnerability database cache
+        id: dc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DC_DATA_DIR }}
+          key: depcheck-db-${{ env.DEPENDENCY_CHECK_VERSION }}-${{ env.week }}
+          restore-keys: depcheck-db-${{ env.DEPENDENCY_CHECK_VERSION }}-
+
+      - name: Update vulnerability database (incremental)
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          args=(--updateonly --data "$DC_DATA_DIR")
+          if [ -n "$NVD_API_KEY" ]; then
+            args+=(--nvdApiKey "$NVD_API_KEY")
+          else
+            echo "::warning::NVD_API_KEY not set. The first NVD download will be very slow. Get a free key at https://nvd.nist.gov/developers/request-an-api-key"
+          fi
+          dependency-check.sh "${args[@]}"
+
+      # Saved separately so the cache is kept even when the scan step fails on vulnerabilities.
+      - name: Save vulnerability database cache
+        if: steps.dc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DC_DATA_DIR }}
+          key: depcheck-db-${{ env.DEPENDENCY_CHECK_VERSION }}-${{ env.week }}
+
+      - name: Resolve Java dependencies for scanning
+        env:
+          COMPONENTS: ${{ needs.config.outputs.components }}
+        run: |
+          set -uo pipefail
+          jq -c '.[]' <<<"$COMPONENTS" | while read -r c; do
+            lang=$(jq -r '.language' <<<"$c"); p=$(jq -r '.path' <<<"$c")
+            if [ "$lang" = "java" ] && [ -f "$p/pom.xml" ]; then
+              echo "Resolving Maven dependencies in $p"
+              (cd "$p" && mvn -B -ntp -q dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=target/dc-deps) \
+                || echo "::warning::Could not resolve Maven dependencies in $p"
+            elif [ "$lang" = "java" ]; then
+              echo "::notice::Gradle project in $p: Dependency-Check only sees the build files. Snyk covers Gradle fully."
+            fi
+          done
+
+      - name: Scan dependencies
+        env:
+          CVSS: ${{ needs.config.outputs.dc-cvss }}
+          EXPERIMENTAL: ${{ needs.config.outputs.dc-experimental }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports/dependency-check
+          args=(--project "$GITHUB_REPOSITORY" --scan . --noupdate --data "$DC_DATA_DIR"
+                --out reports/dependency-check --format HTML --format JSON --format SARIF
+                --failOnCVSS "$CVSS"
+                --exclude "**/.git/**" --exclude "**/node_modules/**" --exclude "**/reports/**"
+                --disableOssIndex)
+          if [ -f .ci/dependency-check-suppressions.xml ]; then args+=(--suppression .ci/dependency-check-suppressions.xml); fi
+          if [ "$EXPERIMENTAL" = "true" ]; then args+=(--enableExperimental); fi
+          dependency-check.sh "${args[@]}"
+          rc=$?
+          f=reports/dependency-check/dependency-check-report.json
+          if [ -f "$f" ]; then
+            {
+              echo "### OWASP Dependency-Check (fails at CVSS >= $CVSS)"
+              jq -r '[.dependencies[]?.vulnerabilities[]?.severity] | group_by(.) | map("- \(.[0]): \(length)") | .[]' "$f"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-dependency-check
+          path: reports/dependency-check
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload SARIF to code scanning
+        if: always() && needs.config.outputs.upload-sarif == 'true' && hashFiles('reports/dependency-check/dependency-check-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check/dependency-check-report.sarif
+          category: dependency-check
+
+  # ---------------------------------------------------------------------------
+  # 7. SonarQube: per component, reuses the coverage from unit-tests, enforces the Quality Gate
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube (${{ matrix.component.name }})
+    needs: [config, unit-tests]
+    if: >-
+      needs.config.outputs.sonar-enabled == 'true' &&
+      (github.event_name != 'pull_request' || needs.config.outputs.sonar-prs == 'true')
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.config.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history gives accurate "new code" and blame data
+
+      - id: stack
+        uses: R0be1/ci-templates/actions/setup-stack@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ matrix.component['build-tool'] }}
+          version: ${{ matrix.component.version }}
+          project-file: ${{ matrix.component['project-file'] }}
+          install-command: ${{ matrix.component['install-command'] }}
+          install: ${{ matrix.component.language == 'java' || matrix.component.language == 'dotnet' }}
+
+      - name: Download coverage
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: coverage-${{ matrix.component.name }}
+          path: ${{ matrix.component.path }}/${{ matrix.component['coverage-dir'] || steps.stack.outputs.coverage-dir }}
+
+      - uses: R0be1/ci-templates/actions/sonar-scan@v1
+        with:
+          language: ${{ matrix.component.language }}
+          path: ${{ matrix.component.path }}
+          build-tool: ${{ steps.stack.outputs.build-tool }}
+          project-file: ${{ matrix.component['project-file'] }}
+          project-key: ${{ matrix.component['sonar-project-key'] || format('{0}_{1}', needs.config.outputs.sonar-prefix, matrix.component.name) }}
+          organization: ${{ needs.config.outputs.sonar-org }}
+          coverage-dir: ${{ matrix.component['coverage-dir'] || steps.stack.outputs.coverage-dir }}
+          quality-gate: ${{ needs.config.outputs.sonar-qg }}
+          extra-args: ${{ matrix.component['sonar-args'] }}
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+          sonar-host-url: ${{ secrets.SONAR_HOST_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 8. Single gate: make THIS the only required status check in branch protection
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs: [config, secret-scan, sast, lint, unit-tests, snyk, dependency-check, sonarqube]
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Evaluate results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### CI Gate"
+            echo "| Check | Result |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"$NEEDS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if jq -e 'to_entries | any(.value.result == "failure" or .value.result == "cancelled")' <<<"$NEEDS" >/dev/null; then
+            echo "::error::One or more CI checks failed. Do NOT deploy."
+            exit 1
+          fi
+          echo "All enabled checks passed. Ready for manual review and deployment."

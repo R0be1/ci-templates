@@ -1,0 +1,29 @@
+# Full-stack monorepo: React frontend + ASP.NET Core backend + Python worker.
+# Each component gets its own parallel lint / test / Snyk / Sonar job; secrets, SAST
+# and Dependency-Check run once for the whole repo.
+components:
+  - name: frontend
+    path: frontend
+    language: node
+    test-command: npx vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text
+  - name: backend
+    path: backend
+    language: dotnet
+    project-file: Backend.sln
+  - name: worker
+    path: worker
+    language: python
+
+secrets:
+  fail-on-findings: true
+sast:
+  rules: "p/default p/owasp-top-ten"
+  severity: "ERROR,WARNING"
+snyk:
+  enabled: true
+  severity-threshold: high
+dependency-check:
+  fail-on-cvss: 9
+sonar:
+  enabled: true
+  analyze-pull-requests: false    # e.g. SonarQube Community Build

@@ -1,0 +1,65 @@
+name: Unit tests with coverage
+description: Runs unit tests and writes coverage reports in a format SonarQube understands. Override with `command`, or set it to "skip".
+
+inputs:
+  language:
+    required: true
+    description: node | python | java | dotnet
+  path:
+    default: "."
+    description: Component directory.
+  build-tool:
+    default: ""
+    description: Resolved build tool from setup-stack.
+  project-file:
+    default: ""
+    description: (.NET) solution or test project file.
+  command:
+    default: ""
+    description: Custom test command, or "skip".
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        LANGUAGE: ${{ inputs.language }}
+        TOOL: ${{ inputs.build-tool }}
+        PROJECT_FILE: ${{ inputs.project-file }}
+        CMD: ${{ inputs.command }}
+        CI: "true"
+      run: |
+        set -euo pipefail
+        if [ "$CMD" = "skip" ]; then echo "::warning::Unit tests skipped by config"; exit 0; fi
+        if [ -z "$CMD" ]; then
+          case "$LANGUAGE" in
+            node)
+              # Expected output: coverage/lcov.info (Jest does this by default; for Vitest add --coverage.reporter=lcov)
+              if ! jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+                echo "::error::No \"test\" script in package.json. Add one or set test-command in .ci/ci.yml"; exit 1
+              fi
+              case "$TOOL" in
+                yarn) CMD="yarn test --coverage" ;;
+                pnpm) CMD="pnpm test --coverage" ;;
+                *)    CMD="npm test -- --coverage" ;;
+              esac ;;
+            python)
+              CMD="pytest --cov=. --cov-report=xml:coverage/coverage.xml --cov-report=term-missing --junitxml=coverage/junit.xml" ;;
+            java)
+              if [ "$TOOL" = "maven" ]; then
+                MVN=mvn; if [ -x ./mvnw ]; then MVN=./mvnw; fi
+                # JaCoCo is added on the fly, so no pom.xml change is needed. Report: target/site/jacoco/jacoco.xml
+                CMD="$MVN -B -ntp org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.12:report"
+              else
+                G=gradle; if [ -x ./gradlew ]; then G=./gradlew; fi
+                # Needs the 'jacoco' plugin in build.gradle (with xml.required = true)
+                CMD="$G test jacocoTestReport --no-daemon"
+              fi ;;
+            dotnet)
+              # Test projects need the coverlet.collector package (included in xUnit/NUnit/MSTest templates)
+              CMD="dotnet test $PROJECT_FILE --no-restore --collect:\"XPlat Code Coverage\" --results-directory coverage --logger trx -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover,cobertura" ;;
+          esac
+        fi
+        echo "+ $CMD"
+        eval "$CMD"

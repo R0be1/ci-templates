@@ -1,0 +1,17 @@
+# NestJS API (Jest is built in)
+components:
+  - name: api
+    path: .
+    language: node
+    version: "22"
+    # Nest's default "lint" script uses --fix, which never fails in CI. Lint without fixing:
+    lint-command: npx eslint "{src,apps,libs,test}/**/*.ts"
+    test-command: npm test -- --coverage --coverageReporters=lcov --coverageReporters=text-summary
+
+snyk:
+  enabled: true
+  severity-threshold: high
+sonar:
+  enabled: true
+dependency-check:
+  fail-on-cvss: 7

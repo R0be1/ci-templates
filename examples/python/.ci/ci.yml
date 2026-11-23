@@ -1,0 +1,18 @@
+# Python (FastAPI / Flask / Django). Default lint = ruff check + ruff format --check; tests = pytest + pytest-cov
+components:
+  - name: api
+    path: .
+    language: python
+    version: "3.12"
+    # Poetry project?  install-command: pip install poetry && poetry install --with dev
+    #                  test-command: poetry run pytest --cov=. --cov-report=xml:coverage/coverage.xml
+    # Django:          add pytest-django to requirements-dev.txt and DJANGO_SETTINGS_MODULE in pytest.ini
+
+sast:
+  rules: "p/default p/python"
+snyk:
+  enabled: true
+dependency-check:
+  enable-experimental: true       # Python analyzers are experimental in Dependency-Check
+sonar:
+  enabled: true

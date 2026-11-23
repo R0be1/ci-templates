@@ -1,0 +1,14 @@
+# Next.js 15/16 app (`next lint` was removed in Next 16, so ESLint runs directly) + Vitest
+components:
+  - name: web
+    path: .
+    language: node
+    version: "22"
+    lint-command: npx eslint . && npx tsc --noEmit
+    test-command: npx vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text
+    sonar-args: -Dsonar.exclusions=**/.next/**,**/node_modules/**
+
+snyk:
+  enabled: true
+sonar:
+  enabled: true

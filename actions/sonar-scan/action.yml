@@ -1,0 +1,135 @@
+name: SonarQube scan
+description: Runs the right SonarScanner for the stack, imports coverage, and (optionally) waits for and enforces the Quality Gate.
+
+inputs:
+  language:
+    required: true
+    description: node | python | java | dotnet
+  path:
+    default: "."
+    description: Component directory (becomes the Sonar project base dir).
+  build-tool:
+    default: ""
+    description: Resolved build tool from setup-stack.
+  project-file:
+    default: ""
+    description: (.NET) solution or project file.
+  project-key:
+    required: true
+    description: Sonar project key.
+  organization:
+    default: ""
+    description: SonarQube Cloud organization (leave empty for self-hosted SonarQube).
+  coverage-dir:
+    default: coverage
+    description: Coverage directory, relative to path.
+  quality-gate:
+    default: "true"
+    description: Wait for the Quality Gate and fail the job if it fails.
+  extra-args:
+    default: ""
+    description: Extra -Dsonar.* arguments.
+  sonar-token:
+    required: true
+    description: SONAR_TOKEN secret.
+  sonar-host-url:
+    default: ""
+    description: SONAR_HOST_URL secret (empty = SonarQube Cloud).
+
+runs:
+  using: composite
+  steps:
+    - id: prep
+      shell: bash
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        HOST: ${{ inputs.sonar-host-url }}
+        KEY: ${{ inputs.project-key }}
+        ORG: ${{ inputs.organization }}
+        LANGUAGE: ${{ inputs.language }}
+        COV: ${{ inputs.coverage-dir }}
+        QG: ${{ inputs.quality-gate }}
+        EXTRA: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+        if [ -z "$SONAR_TOKEN" ]; then
+          echo "::error::sonar.enabled is true but the SONAR_TOKEN secret is missing (caller must use 'secrets: inherit')"; exit 1
+        fi
+        HOST="${HOST:-https://sonarcloud.io}"
+        ARGS="-Dsonar.projectKey=$KEY -Dsonar.qualitygate.wait=$QG -Dsonar.qualitygate.timeout=300"
+        if [ -n "$ORG" ]; then ARGS="$ARGS -Dsonar.organization=$ORG"; fi
+        case "$LANGUAGE" in
+          node)   ARGS="$ARGS -Dsonar.javascript.lcov.reportPaths=$COV/lcov.info" ;;
+          python) ARGS="$ARGS -Dsonar.python.coverage.reportPaths=$COV/coverage.xml" ;;
+        esac
+        if [ -n "$EXTRA" ]; then ARGS="$ARGS $EXTRA"; fi
+        echo "host=$HOST" >> "$GITHUB_OUTPUT"
+        echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+        echo "Sonar project: $KEY @ $HOST"
+
+    # Node.js / TypeScript / Python (and any language the generic scanner supports)
+    - if: inputs.language == 'node' || inputs.language == 'python'
+      uses: SonarSource/sonarqube-scan-action@v5
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        SONAR_HOST_URL: ${{ steps.prep.outputs.host }}
+      with:
+        projectBaseDir: ${{ inputs.path }}
+        args: ${{ steps.prep.outputs.args }}
+
+    # Java / Maven: no pom.xml change required
+    - if: inputs.language == 'java' && inputs.build-tool == 'maven'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        HOST: ${{ steps.prep.outputs.host }}
+        ARGS: ${{ steps.prep.outputs.args }}
+        COV: ${{ inputs.coverage-dir }}
+      run: |
+        set -euo pipefail
+        MVN=mvn; if [ -x ./mvnw ]; then MVN=./mvnw; fi
+        # shellcheck disable=SC2086
+        $MVN -B -ntp -DskipTests test-compile org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+          -Dsonar.host.url="$HOST" -Dsonar.coverage.jacoco.xmlReportPaths="$COV/jacoco.xml" $ARGS
+
+    # Java / Gradle: requires `id "org.sonarqube"` in build.gradle
+    - if: inputs.language == 'java' && inputs.build-tool == 'gradle'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        HOST: ${{ steps.prep.outputs.host }}
+        ARGS: ${{ steps.prep.outputs.args }}
+      run: |
+        set -euo pipefail
+        G=gradle; if [ -x ./gradlew ]; then G=./gradlew; fi
+        # shellcheck disable=SC2086
+        $G compileJava compileTestJava sonar --no-daemon -Dsonar.host.url="$HOST" $ARGS
+
+    # .NET (C#): SonarScanner for .NET wraps the build
+    - if: inputs.language == 'dotnet'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        HOST: ${{ steps.prep.outputs.host }}
+        KEY: ${{ inputs.project-key }}
+        ORG: ${{ inputs.organization }}
+        QG: ${{ inputs.quality-gate }}
+        COV: ${{ inputs.coverage-dir }}
+        EXTRA: ${{ inputs.extra-args }}
+        PROJECT_FILE: ${{ inputs.project-file }}
+      run: |
+        set -euo pipefail
+        dotnet tool install --global dotnet-sonarscanner >/dev/null 2>&1 || dotnet tool update --global dotnet-sonarscanner
+        export PATH="$PATH:$HOME/.dotnet/tools"
+        begin=(/k:"$KEY" /d:sonar.host.url="$HOST" /d:sonar.token="$SONAR_TOKEN"
+               /d:sonar.qualitygate.wait="$QG" /d:sonar.qualitygate.timeout=300
+               "/d:sonar.cs.opencover.reportsPaths=$COV/**/coverage.opencover.xml")
+        if [ -n "$ORG" ]; then begin+=(/o:"$ORG"); fi
+        for a in $EXTRA; do begin+=("/d:${a#-D}"); done
+        dotnet sonarscanner begin "${begin[@]}"
+        # shellcheck disable=SC2086
+        dotnet build $PROJECT_FILE --no-restore --no-incremental
+        dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"

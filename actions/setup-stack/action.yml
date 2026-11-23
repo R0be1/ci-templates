@@ -1,0 +1,185 @@
+name: Setup language stack
+description: Installs the runtime, restores dependency caches and installs project dependencies (node | python | java | dotnet).
+
+inputs:
+  language:
+    description: node | python | java | dotnet
+    required: true
+  path:
+    description: Component directory, relative to the repo root.
+    default: "."
+  build-tool:
+    description: "node: npm|yarn|pnpm, java: maven|gradle. Auto-detected when empty."
+    default: ""
+  version:
+    description: Runtime version. Defaults to node lts/* (or .nvmrc), python 3.12, java 21, dotnet 10.0.x (or global.json).
+    default: ""
+  project-file:
+    description: (.NET) solution or project file, relative to path, when the folder holds more than one.
+    default: ""
+  install:
+    description: Install project dependencies.
+    default: "true"
+  install-command:
+    description: Custom install command (replaces the default).
+    default: ""
+
+outputs:
+  build-tool:
+    description: Resolved build tool.
+    value: ${{ steps.resolve.outputs.build-tool }}
+  coverage-dir:
+    description: Default coverage directory, relative to path.
+    value: ${{ steps.resolve.outputs.coverage-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        LANGUAGE: ${{ inputs.language }}
+        P: ${{ inputs.path }}
+        TOOL: ${{ inputs.build-tool }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ ! -d "$P" ]; then echo "::error::Component path '$P' does not exist"; exit 1; fi
+        VERSION_FILE=""; NODE_CACHE=""; PY_CACHE=""; JAVA_CACHE_PATH=""; GLOBAL_JSON=""
+        case "$LANGUAGE" in
+          node)
+            if [ -z "$TOOL" ]; then
+              if [ -f "$P/pnpm-lock.yaml" ]; then TOOL=pnpm
+              elif [ -f "$P/yarn.lock" ]; then TOOL=yarn
+              else TOOL=npm; fi
+            fi
+            if [ -z "$VERSION" ] && [ -f "$P/.nvmrc" ]; then VERSION_FILE="$P/.nvmrc"
+            elif [ -z "$VERSION" ]; then VERSION="lts/*"; fi
+            if [ "$TOOL" = "npm" ] && [ -f "$P/package-lock.json" ]; then NODE_CACHE=npm; fi
+            COV=coverage ;;
+          python)
+            TOOL="${TOOL:-pip}"; VERSION="${VERSION:-3.12}"; COV=coverage
+            if compgen -G "$P/requirements*.txt" >/dev/null || [ -f "$P/pyproject.toml" ] || [ -f "$P/setup.py" ]; then PY_CACHE=pip; fi ;;
+          java)
+            if [ -z "$TOOL" ]; then
+              if [ -f "$P/pom.xml" ]; then TOOL=maven
+              elif compgen -G "$P/build.gradle*" >/dev/null; then TOOL=gradle
+              else echo "::error::No pom.xml or build.gradle found in $P"; exit 1; fi
+            fi
+            VERSION="${VERSION:-21}"
+            if [ "$TOOL" = "maven" ]; then COV=target/site/jacoco; JAVA_CACHE_PATH="$P/**/pom.xml"
+            else COV=build/reports/jacoco/test; JAVA_CACHE_PATH="$P/**/*.gradle*"; fi ;;
+          dotnet)
+            TOOL=dotnet; COV=coverage
+            if [ -z "$VERSION" ] && [ -f "$P/global.json" ]; then GLOBAL_JSON="$P/global.json"
+            elif [ -z "$VERSION" ]; then VERSION="10.0.x"; fi ;;
+          *)
+            echo "::error::Unsupported language '$LANGUAGE' (use node | python | java | dotnet)"; exit 1 ;;
+        esac
+        {
+          echo "build-tool=$TOOL"
+          echo "version=$VERSION"
+          echo "version-file=$VERSION_FILE"
+          echo "coverage-dir=$COV"
+          echo "node-cache=$NODE_CACHE"
+          echo "py-cache=$PY_CACHE"
+          echo "java-cache-path=$JAVA_CACHE_PATH"
+          echo "global-json=$GLOBAL_JSON"
+        } >> "$GITHUB_OUTPUT"
+        echo "Stack: $LANGUAGE / $TOOL / ${VERSION:-$VERSION_FILE$GLOBAL_JSON} (path: $P)"
+
+    # ---------------- Node.js ----------------
+    - if: inputs.language == 'node'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.resolve.outputs.version }}
+        node-version-file: ${{ steps.resolve.outputs.version-file }}
+        cache: ${{ steps.resolve.outputs.node-cache }}
+        cache-dependency-path: ${{ inputs.path }}/package-lock.json
+
+    - if: inputs.language == 'node' && steps.resolve.outputs.build-tool != 'npm'
+      shell: bash
+      run: |
+        command -v corepack >/dev/null || npm install -g corepack
+        corepack enable
+
+    - if: inputs.language == 'node' && steps.resolve.outputs.build-tool != 'npm'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/yarn
+          ~/.yarn/berry/cache
+          ~/.local/share/pnpm/store
+          ~/.cache/pnpm
+        key: ${{ runner.os }}-${{ steps.resolve.outputs.build-tool }}-${{ hashFiles(format('{0}/yarn.lock', inputs.path), format('{0}/pnpm-lock.yaml', inputs.path)) }}
+        restore-keys: ${{ runner.os }}-${{ steps.resolve.outputs.build-tool }}-
+
+    # ---------------- Python ----------------
+    - if: inputs.language == 'python'
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ steps.resolve.outputs.version }}
+        cache: ${{ steps.resolve.outputs.py-cache }}
+        cache-dependency-path: |
+          ${{ inputs.path }}/**/requirements*.txt
+          ${{ inputs.path }}/pyproject.toml
+          ${{ inputs.path }}/setup.py
+
+    # ---------------- Java ----------------
+    - if: inputs.language == 'java'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ steps.resolve.outputs.version }}
+        cache: ${{ steps.resolve.outputs.build-tool }}
+        cache-dependency-path: ${{ steps.resolve.outputs.java-cache-path }}
+
+    # ---------------- .NET ----------------
+    - if: inputs.language == 'dotnet'
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ steps.resolve.outputs.version }}
+        global-json-file: ${{ steps.resolve.outputs.global-json }}
+
+    - if: inputs.language == 'dotnet'
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles(format('{0}/**/*.csproj', inputs.path), format('{0}/**/packages.lock.json', inputs.path), format('{0}/**/Directory.Packages.props', inputs.path)) }}
+        restore-keys: ${{ runner.os }}-nuget-
+
+    # ---------------- Install dependencies ----------------
+    - if: inputs.install == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        LANGUAGE: ${{ inputs.language }}
+        TOOL: ${{ steps.resolve.outputs.build-tool }}
+        CMD: ${{ inputs.install-command }}
+        PROJECT_FILE: ${{ inputs.project-file }}
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+        if [ -n "$CMD" ]; then echo "+ $CMD"; eval "$CMD"; exit 0; fi
+        case "$LANGUAGE" in
+          node)
+            case "$TOOL" in
+              npm)  if [ -f package-lock.json ]; then npm ci; else echo "::warning::No package-lock.json, using npm install (commit a lockfile for reproducible CI)"; npm install; fi ;;
+              yarn) if [ -f .yarnrc.yml ]; then yarn install --immutable; else yarn install --frozen-lockfile; fi ;;
+              pnpm) pnpm install --frozen-lockfile ;;
+            esac ;;
+          python)
+            python -m pip install --upgrade pip
+            for f in requirements.txt requirements-dev.txt requirements_dev.txt requirements-test.txt dev-requirements.txt; do
+              if [ -f "$f" ]; then pip install -r "$f"; fi
+            done
+            if [ ! -f requirements.txt ] && { [ -f pyproject.toml ] || [ -f setup.py ]; }; then
+              pip install -e ".[dev,test]" || pip install -e .
+            fi
+            pip install ruff pytest pytest-cov ;;
+          java)
+            echo "Maven/Gradle resolve dependencies during the build (cached by setup-java)." ;;
+          dotnet)
+            # shellcheck disable=SC2086
+            dotnet restore $PROJECT_FILE ;;
+        esac

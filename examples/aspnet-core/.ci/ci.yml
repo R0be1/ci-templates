@@ -1,0 +1,14 @@
+# ASP.NET Core Web API + xUnit test project (coverlet.collector is in the xUnit template)
+components:
+  - name: api
+    path: .
+    language: dotnet
+    version: "10.0.x"             # or leave empty to use global.json
+    project-file: MyApi.sln       # needed when the folder holds more than one .sln/.csproj
+
+snyk:
+  enabled: true                   # Snyk covers NuGet better than Dependency-Check
+sonar:
+  enabled: true
+dependency-check:
+  fail-on-cvss: 9                 # critical only, since Snyk gates High

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copy to <project>/.ci/dependency-check-suppressions.xml (picked up automatically). -->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+  <!--
+  <suppress until="2027-06-30Z">
+    <notes>False positive: CVE applies to the server package, not the client library. Reviewed by: me, 2026-11-23</notes>
+    <packageUrl regex="true">^pkg:npm/some-package@.*$</packageUrl>
+    <cve>CVE-2025-00000</cve>
+  </suppress>
+  -->
+</suppressions>

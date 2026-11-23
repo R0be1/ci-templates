@@ -1,0 +1,15 @@
+# Spring Boot (Maven). JaCoCo is injected automatically; no pom.xml change needed.
+# Add maven-checkstyle-plugin or spotless-maven-plugin to pom.xml to ENFORCE lint rules.
+components:
+  - name: service
+    path: .
+    language: java
+    build-tool: maven             # or gradle (needs jacoco + org.sonarqube plugins in build.gradle)
+    version: "21"
+
+snyk:
+  enabled: true
+sonar:
+  enabled: true
+dependency-check:
+  fail-on-cvss: 7

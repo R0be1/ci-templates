@@ -1,0 +1,67 @@
+name: Lint
+description: Runs the project's linter / formatter check. Fails the job on violations. Override with `command`, or set it to "skip".
+
+inputs:
+  language:
+    required: true
+    description: node | python | java | dotnet
+  path:
+    default: "."
+    description: Component directory.
+  build-tool:
+    default: ""
+    description: Resolved build tool from setup-stack.
+  project-file:
+    default: ""
+    description: (.NET) solution or project file.
+  command:
+    default: ""
+    description: Custom lint command, or "skip".
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        LANGUAGE: ${{ inputs.language }}
+        TOOL: ${{ inputs.build-tool }}
+        PROJECT_FILE: ${{ inputs.project-file }}
+        CMD: ${{ inputs.command }}
+      run: |
+        set -euo pipefail
+        if [ "$CMD" = "skip" ]; then echo "::notice::Lint skipped by config"; exit 0; fi
+        if [ -z "$CMD" ]; then
+          case "$LANGUAGE" in
+            node)
+              if ! jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
+                echo "::error::No \"lint\" script in package.json. Add one (e.g. \"lint\": \"eslint .\") or set lint-command in .ci/ci.yml"; exit 1
+              fi
+              case "$TOOL" in
+                yarn) CMD="yarn lint" ;;
+                pnpm) CMD="pnpm run lint" ;;
+                *)    CMD="npm run lint" ;;
+              esac ;;
+            python)
+              CMD="ruff check . && ruff format --check ." ;;
+            java)
+              if [ "$TOOL" = "maven" ]; then
+                MVN=mvn; if [ -x ./mvnw ]; then MVN=./mvnw; fi
+                if grep -q "spotless-maven-plugin" pom.xml; then
+                  CMD="$MVN -B -ntp spotless:check"
+                elif grep -q "maven-checkstyle-plugin" pom.xml; then
+                  CMD="$MVN -B -ntp checkstyle:check"
+                else
+                  echo "::warning::No Checkstyle/Spotless plugin in pom.xml. Running Google Checks in report-only mode. Configure a plugin or set lint-command to enforce."
+                  CMD="$MVN -B -ntp checkstyle:check -Dcheckstyle.config.location=google_checks.xml -Dcheckstyle.consoleOutput=true -Dcheckstyle.violationSeverity=error"
+                fi
+              else
+                G=gradle; if [ -x ./gradlew ]; then G=./gradlew; fi
+                CMD="$G check -x test --no-daemon"
+              fi ;;
+            dotnet)
+              CMD="dotnet format $PROJECT_FILE --verify-no-changes --no-restore --verbosity minimal" ;;
+          esac
+        fi
+        echo "+ $CMD"
+        eval "$CMD"

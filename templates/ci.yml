@@ -1,0 +1,46 @@
+# .ci/ci.yml: the ONLY per-project configuration file.
+# Every key except `components` is optional; the defaults are shown.
+
+components:                    # one entry per app/service; each runs as its own parallel job
+  - name: app                  # letters, digits, . _ -  (used in job and artifact names)
+    path: .                    # folder containing package.json / pom.xml / *.csproj / pyproject.toml
+    language: node             # node | python | java | dotnet
+    # build-tool: npm          # node: npm|yarn|pnpm   java: maven|gradle   (auto-detected)
+    # version: "22"            # node lts/* (or .nvmrc) | python 3.12 | java 21 | dotnet 10.0.x (or global.json)
+    # project-file: My.sln     # .NET only, when the folder has several .sln/.csproj
+    # install-command: ""      # replace the default dependency install
+    # lint-command: ""         # replace the default lint ("skip" to disable; not recommended)
+    # test-command: ""         # replace the default test command ("skip" to disable)
+    # coverage-dir: coverage   # where the test command writes coverage, relative to path
+    # sonar-project-key: ""    # default: <project-key-prefix>_<name>
+    # sonar-args: ""           # extra -Dsonar.* flags
+
+secrets:                       # Gitleaks
+  enabled: true
+  fail-on-findings: true
+
+sast:                          # Semgrep CE
+  enabled: true
+  rules: "p/default"           # space-separated, e.g. "p/default p/owasp-top-ten p/nodejs"
+  severity: "ERROR"            # ERROR | WARNING | INFO (comma-separated)
+  fail-on-findings: false      # report only (set true to block)
+
+snyk:
+  enabled: false               # needs SNYK_TOKEN
+  severity-threshold: high     # low | medium | high | critical
+  org: ""
+
+dependency-check:              # OWASP Dependency-Check
+  enabled: true
+  fail-on-cvss: 7              # 7 = fail on High+Critical, 9 = Critical only, 11 = never fail
+  run-on-pull-requests: false  # false = only push/schedule (Snyk covers PRs, so no double scan)
+  enable-experimental: false   # true for better Python coverage
+
+sonar:
+  enabled: false               # needs SONAR_TOKEN (+ SONAR_HOST_URL for self-hosted)
+  quality-gate: true           # fail the build when the Quality Gate fails
+  analyze-pull-requests: true  # set false on SonarQube Community Build (it has no PR/branch analysis)
+  organization: ""             # SonarQube Cloud only
+  # project-key-prefix: owner_repo
+
+upload-sarif: false            # true = show findings in GitHub Security tab (free on public repos; private needs GitHub Code Security)

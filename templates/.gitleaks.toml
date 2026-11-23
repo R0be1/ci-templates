@@ -1,0 +1,11 @@
+# Copy to the project root as .gitleaks.toml (optional). Gitleaks loads it automatically.
+# To ignore a single known false positive, add its fingerprint to .gitleaksignore instead.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project-wide allowlist"
+paths = [
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)(test|tests|__tests__)/fixtures/''',
+]

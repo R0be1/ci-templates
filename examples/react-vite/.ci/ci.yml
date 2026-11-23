@@ -1,0 +1,10 @@
+# React (Vite) SPA + Vitest. Needs the @vitest/coverage-v8 dev dependency.
+components:
+  - name: web
+    path: .
+    language: node
+    lint-command: npm run lint            # Vite template: "lint": "eslint ."
+    test-command: npx vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text
+
+sonar:
+  enabled: true
