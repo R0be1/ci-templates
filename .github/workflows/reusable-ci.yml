@@ -456,7 +456,7 @@ jobs:
 
       - name: Restore vulnerability database cache
         id: dc-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.DC_DATA_DIR }}
           key: depcheck-db-${{ env.DEPENDENCY_CHECK_VERSION }}-${{ env.week }}
@@ -478,7 +478,7 @@ jobs:
       # Saved separately so the cache is kept even when the scan step fails on vulnerabilities.
       - name: Save vulnerability database cache
         if: steps.dc-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.DC_DATA_DIR }}
           key: depcheck-db-${{ env.DEPENDENCY_CHECK_VERSION }}-${{ env.week }}
