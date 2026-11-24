@@ -45,7 +45,7 @@ env:
   # Tool versions are pinned centrally: bump them here and every project gets the update.
   GITLEAKS_VERSION: "8.24.0"
   DEPENDENCY_CHECK_VERSION: "12.1.0"
-  SEMGREP_VERSION: ""          # empty = latest
+  SEMGREP_VERSION: "" # empty = latest
   DC_DATA_DIR: /home/runner/.dependency-check-data
 
 jobs:
@@ -56,26 +56,27 @@ jobs:
     name: Load config
     runs-on: ${{ inputs.runs-on }}
     outputs:
-      components:        ${{ steps.cfg.outputs.components }}
-      secrets-enabled:   ${{ steps.cfg.outputs.secrets-enabled }}
-      secrets-fail:      ${{ steps.cfg.outputs.secrets-fail }}
-      sast-enabled:      ${{ steps.cfg.outputs.sast-enabled }}
-      sast-rules:        ${{ steps.cfg.outputs.sast-rules }}
-      sast-severity:     ${{ steps.cfg.outputs.sast-severity }}
-      sast-fail:         ${{ steps.cfg.outputs.sast-fail }}
-      snyk-enabled:      ${{ steps.cfg.outputs.snyk-enabled }}
-      snyk-threshold:    ${{ steps.cfg.outputs.snyk-threshold }}
-      snyk-org:          ${{ steps.cfg.outputs.snyk-org }}
-      dc-enabled:        ${{ steps.cfg.outputs.dc-enabled }}
-      dc-cvss:           ${{ steps.cfg.outputs.dc-cvss }}
-      dc-on-pr:          ${{ steps.cfg.outputs.dc-on-pr }}
-      dc-experimental:   ${{ steps.cfg.outputs.dc-experimental }}
-      sonar-enabled:     ${{ steps.cfg.outputs.sonar-enabled }}
-      sonar-prs:         ${{ steps.cfg.outputs.sonar-prs }}
-      sonar-qg:          ${{ steps.cfg.outputs.sonar-qg }}
-      sonar-org:         ${{ steps.cfg.outputs.sonar-org }}
-      sonar-prefix:      ${{ steps.cfg.outputs.sonar-prefix }}
-      upload-sarif:      ${{ steps.cfg.outputs.upload-sarif }}
+      components: ${{ steps.cfg.outputs.components }}
+      secrets-enabled: ${{ steps.cfg.outputs.secrets-enabled }}
+      secrets-fail: ${{ steps.cfg.outputs.secrets-fail }}
+      sast-enabled: ${{ steps.cfg.outputs.sast-enabled }}
+      sast-rules: ${{ steps.cfg.outputs.sast-rules }}
+      sast-severity: ${{ steps.cfg.outputs.sast-severity }}
+      sast-fail: ${{ steps.cfg.outputs.sast-fail }}
+      snyk-enabled: ${{ steps.cfg.outputs.snyk-enabled }}
+      snyk-threshold: ${{ steps.cfg.outputs.snyk-threshold }}
+      snyk-org: ${{ steps.cfg.outputs.snyk-org }}
+      dc-enabled: ${{ steps.cfg.outputs.dc-enabled }}
+      dc-cvss: ${{ steps.cfg.outputs.dc-cvss }}
+      dc-on-pr: ${{ steps.cfg.outputs.dc-on-pr }}
+      dc-experimental: ${{ steps.cfg.outputs.dc-experimental }}
+      sonar-enabled: ${{ steps.cfg.outputs.sonar-enabled }}
+      sonar-prs: ${{ steps.cfg.outputs.sonar-prs }}
+      sonar-qg: ${{ steps.cfg.outputs.sonar-qg }}
+      sonar-org: ${{ steps.cfg.outputs.sonar-org }}
+      sonar-prefix: ${{ steps.cfg.outputs.sonar-prefix }}
+      sonar-main-only: ${{ steps.cfg.outputs.sonar-main-only }}
+      upload-sarif: ${{ steps.cfg.outputs.upload-sarif }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,6 +128,7 @@ jobs:
             echo "sonar-qg=$(get '.sonar.quality-gate' true)"
             echo "sonar-org=$(get '.sonar.organization' '')"
             echo "sonar-prefix=$(get '.sonar.project-key-prefix' "$default_prefix")"
+            echo "sonar-main-only=$(get '.sonar.main-branch-only' false)"
             echo "upload-sarif=$(get '.upload-sarif' false)"
           } >> "$GITHUB_OUTPUT"
 
@@ -545,7 +547,10 @@ jobs:
     needs: [config, unit-tests]
     if: >-
       needs.config.outputs.sonar-enabled == 'true' &&
-      (github.event_name != 'pull_request' || needs.config.outputs.sonar-prs == 'true')
+      (github.event_name != 'pull_request' || needs.config.outputs.sonar-prs == 'true') &&
+      (needs.config.outputs.sonar-main-only != 'true' ||
+       github.event_name == 'schedule' ||
+       github.ref_name == github.event.repository.default_branch)
     runs-on: ${{ inputs.runs-on }}
     strategy:
       fail-fast: false
@@ -554,7 +559,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history gives accurate "new code" and blame data
+          fetch-depth: 0 # full history gives accurate "new code" and blame data
 
       - id: stack
         uses: R0be1/ci-templates/actions/setup-stack@v1
@@ -594,7 +599,17 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [config, secret-scan, sast, lint, unit-tests, snyk, dependency-check, sonarqube]
+    needs:
+      [
+        config,
+        secret-scan,
+        sast,
+        lint,
+        unit-tests,
+        snyk,
+        dependency-check,
+        sonarqube,
+      ]
     runs-on: ${{ inputs.runs-on }}
     steps:
       - name: Evaluate results
