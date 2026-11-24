@@ -104,7 +104,7 @@ runs:
         corepack enable
 
     - if: inputs.language == 'node' && steps.resolve.outputs.build-tool != 'npm'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cache/yarn
@@ -142,7 +142,7 @@ runs:
         global-json-file: ${{ steps.resolve.outputs.global-json }}
 
     - if: inputs.language == 'dotnet'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.nuget/packages
         key: ${{ runner.os }}-nuget-${{ hashFiles(format('{0}/**/*.csproj', inputs.path), format('{0}/**/packages.lock.json', inputs.path), format('{0}/**/Directory.Packages.props', inputs.path)) }}
